@@ -1,0 +1,4 @@
+Segment end: 0x1c14e1, New program break: 0x1c2000
+Segment end: 0x1c2028, New program break: 0x1c3000
+sbrk: old_break = 0x1c3000, increment = 4096, new_break = 0x1c4000
+sbrk: original_break = 0x1c3000, stack_boundary = 0x2ff000
