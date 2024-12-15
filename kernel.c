@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "lib.h"
+//#include <cstdio>
 
 // kernel.c
 //
@@ -32,6 +33,8 @@ void schedule(void);
 void run(proc* p) __attribute__((noreturn));
 
 static uint8_t disp_global = 1;         // global flag to display memviewer
+
+#define PAGE_NUMBER_INVALID ((uintptr_t)-1)
 
 // PAGEINFO
 //
@@ -158,30 +161,98 @@ int syscall_page_alloc(uintptr_t addr) {
 }
 
 
-int sbrk(proc * p, intptr_t difference) {
-    // TODO : Your code here
-    //sanity checks 
-    assert(p != NULL);
-    assert(p->p_pagetable != NULL);
-    //STEP 1: "First just implement the part of the code that moves around the break value."
-    uintptr_t oldbreak = p->program_break; 
-    uintptr_t new_break = oldbreak + difference;
-    //cannot fall below the original break (p->originial_break)
-    // cannot overlap with the stack (MEMSIZE_VIRTUAL - PAGESIZE)
-    if (new_break < p->original_break || new_break >= MEMSIZE_VIRTUAL - PAGESIZE) {
-        return -1;
+void freepage(uintptr_t pa) {
+    // Validate input
+    if (pa == 0) {
+        log_printf("Error: Attempted to free null page\n");
+        return;
+    }
+    // Align the physical address to the page boundary
+    uintptr_t aligned_pa = ROUNDDOWN(pa, PAGESIZE);
+    size_t page_number = aligned_pa / PAGESIZE;
+    // Sanity check: Ensure the page number is valid
+    if (page_number >= NPAGES) {
+        log_printf("Error: Physical address %p out of bounds\n", pa);
+        return;
+    }
+    // Access the pageinfo structure
+    if (pageinfo[page_number].refcount > 0) {
+        // Decrement the reference count
+        pageinfo[page_number].refcount--;
+        // If the page is no longer in use, mark it as free
+        if (pageinfo[page_number].refcount == 0) {
+            pageinfo[page_number].owner = PO_FREE; // Mark as free
+            log_printf("Page %zu (PA %p) freed successfully\n", page_number, aligned_pa);
+        }
     } 
-    p->program_break = new_break;
-    log_printf("sbrk: old_break = %p, increment = %ld, new_break = %p\n",
-           oldbreak, difference, new_break);
-    log_printf("sbrk: original_break = %p, stack_boundary = %p\n",
-           p->original_break, MEMSIZE_VIRTUAL - PAGESIZE);
-
-
-
-    return 0;  // Success
+    else {
+        // Error: Attempting to free a page that is already free
+        log_printf("Error: Attempted to free an unallocated page at PA %p\n", pa);
+    }
 }
 
+
+int virtual_memory_unmap(x86_64_pagetable* pagetable, uintptr_t va) {
+    assert(pagetable != NULL); // Ensure the pagetable is valid
+
+    // Look up the mapping for the given virtual address
+    vamapping map = virtual_memory_lookup(pagetable, va);
+
+    // If no mapping exists, return success
+    if ((uintptr_t)map.pn == PAGE_NUMBER_INVALID) {
+        log_printf("VA %p not mapped. No action taken.\n", va);
+        return 0;
+    }
+
+    // Remove the mapping in the page table
+    if (virtual_memory_map(pagetable, va, 0, PAGESIZE, 0) < 0) {
+        log_printf("Error: Failed to clear mapping for VA %p\n", va);
+        return -1; // Failed to clear mapping
+    }
+
+    // Free the physical page if it exists
+    if (map.pa != 0) {
+        freepage(map.pa);
+        log_printf("Physical page %p freed for VA %p\n", map.pa, va);
+    }
+
+    return 0; // Success
+}
+
+
+
+int sbrk(proc* p, intptr_t difference) {
+    assert(p != NULL);
+    assert(p->p_pagetable != NULL);
+    
+    uintptr_t oldbreak = p->program_break;
+    uintptr_t newbreak = oldbreak + difference;
+    
+    // Check bounds
+    if (newbreak < p->original_break || newbreak >= MEMSIZE_VIRTUAL - PAGESIZE) {
+        return -1;
+    }
+    
+    if (newbreak > oldbreak) { // heap is growing
+        // Just update the program break - don't allocate pages yet
+        p->program_break = newbreak;
+    }
+    else if (newbreak < oldbreak) { // heap is shrinking
+        uintptr_t al_oldbreak = ROUNDUP(oldbreak, PAGESIZE);
+        uintptr_t al_newbreak = ROUNDUP(newbreak, PAGESIZE);
+        
+        // Unmap pages that are no longer needed
+        for (uintptr_t addr = al_newbreak; addr < al_oldbreak; addr += PAGESIZE) {
+            if (virtual_memory_unmap(p->p_pagetable, addr) < 0) {
+                log_printf("Error: Failed to unmap virtual address %p\n", addr);
+                return -1;
+            }
+        }
+        p->program_break = newbreak;
+    }
+    
+    return 0;
+}
 
 void syscall_mapping(proc* p){
     uintptr_t mapping_ptr = p->p_registers.reg_rdi;
@@ -360,23 +431,85 @@ void exception(x86_64_registers* reg) {
 
         case INT_PAGEFAULT: 
             {
-                // Analyze faulting address and access type.
-                uintptr_t addr = rcr2();
-                const char* operation = reg->reg_err & PFERR_WRITE
-                    ? "write" : "read";
-                const char* problem = reg->reg_err & PFERR_PRESENT
-                    ? "protection problem" : "missing page";
+            // Get the faulting address from cr2 register
+            uintptr_t addr = rcr2();
+            
+            // Extract error information
+            const char* operation = reg->reg_err & PFERR_WRITE
+                ? "write" : "read";
+            const char* problem = reg->reg_err & PFERR_PRESENT
+                ? "protection problem" : "missing page";
 
-                if (!(reg->reg_err & PFERR_USER)) {
-                    kernel_panic("Kernel page fault for %p (%s %s, rip=%p)!\n",
-                            addr, operation, problem, reg->reg_rip);
+            // Handle kernel page faults (unchanged)
+            if (!(reg->reg_err & PFERR_USER)) {
+                kernel_panic("Kernel page fault for %p (%s %s, rip=%p)!\n",
+                        addr, operation, problem, reg->reg_rip);
+            }
+
+            // Check if this is a heap access within valid range
+            if (addr >= current->original_break && addr < current->program_break) {
+                // Align the faulting address to page boundary
+                uintptr_t page_addr = ROUNDDOWN(addr, PAGESIZE);
+                
+                // Check if page is already mapped
+                vamapping mapping = virtual_memory_lookup(current->p_pagetable, page_addr);
+                if (mapping.perm & PTE_P) {
+                    current->p_state = P_RUNNABLE;
+                    break;
                 }
-                console_printf(CPOS(24, 0), 0x0C00,
-                        "Process %d page fault for %p (%s %s, rip=%p)!\n",
-                        current->p_pid, addr, operation, problem, reg->reg_rip);
-                current->p_state = P_BROKEN;
-                syscall_exit();
+
+                // Try to allocate a new physical page using palloc
+                void* pa = palloc(current->p_pid);
+                if (!pa) {
+                    console_printf(CPOS(24, 0), 0x0C00,
+                        "Process %d out of physical memory!\n", current->p_pid);
+                    current->p_state = P_BROKEN;
+                    break;
+                }
+
+                // Initialize the page to zero
+                memset(pa, 0, PAGESIZE);
+
+                // Map the new page into the process's address space
+                int r = virtual_memory_map(current->p_pagetable, 
+                                        page_addr,              // virtual address
+                                        (uintptr_t)pa,         // physical address
+                                        PAGESIZE,               // size
+                                        PTE_P | PTE_W | PTE_U); // permissions
+
+                if (r < 0) {
+                    freepage((uintptr_t)pa);
+                    current->p_state = P_BROKEN;
+                    break;
+                }
+
+                current->p_state = P_RUNNABLE;
                 break;
+        }
+
+        // If not in heap range or other error, terminate process as before
+        console_printf(CPOS(24, 0), 0x0C00,
+            "Process %d page fault for %p (%s %s, rip=%p)!\n",
+            current->p_pid, addr, operation, problem, reg->reg_rip);
+        current->p_state = P_BROKEN;
+        break;
+                // // Analyze faulting address and access type.
+                // uintptr_t addr = rcr2();
+                // const char* operation = reg->reg_err & PFERR_WRITE
+                //     ? "write" : "read";
+                // const char* problem = reg->reg_err & PFERR_PRESENT
+                //     ? "protection problem" : "missing page";
+
+                // if (!(reg->reg_err & PFERR_USER)) {
+                //     kernel_panic("Kernel page fault for %p (%s %s, rip=%p)!\n",
+                //             addr, operation, problem, reg->reg_rip);
+                // }
+                // console_printf(CPOS(24, 0), 0x0C00,
+                //         "Process %d page fault for %p (%s %s, rip=%p)!\n",
+                //         current->p_pid, addr, operation, problem, reg->reg_rip);
+                // current->p_state = P_BROKEN;
+                // syscall_exit();
+                // break;
             }
 
         default:
